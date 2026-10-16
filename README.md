@@ -1,93 +1,109 @@
-# export-suite-pdf.js: personal notes
+# export-suite-pdf.js
 
-Turns the **Allure report** into **one PDF of evidence per test**, named after the test's Jira key
-(`output/DAGEP-1985.pdf`), so Zephyr can attach it to the right Test execution.
+Turns an **Allure HTML report** into **one PDF of evidence per test**, named after the Jira key in the test title
+(`output/ABC-123.pdf`). Useful for attaching evidence to test-management tools (Zephyr, Xray, ...) that match a
+file to a test by its name.
 
 ```
-allure-results/  --(allure generate)-->  allure-report/  --(this script)-->  output/<JIRA-KEY>.pdf  --(zephyrClient.js)-->  Zephyr
+allure-results/  --(allure generate)-->  allure-report/  --(export-suite-pdf.js)-->  output/<JIRA-KEY>.pdf
 ```
 
-## Run it
+Each test is rendered as an HTML page and printed to A4 by headless Chrome (Puppeteer), so the whole layout is CSS.
+
+## Requirements
+
+- Node.js 16+
+- `puppeteer` (`npm install puppeteer`)
+- An Allure HTML report in `./allure-report` (generated with `allure generate allure-results -o allure-report`)
+
+The script resolves `./allure-report` and `./output` from the **current working directory**.
+
+## Usage
 
 ```sh
-npx allure generate allure-results --clean -o allure-report   # needs an HTML report first
-node ci/export-suite-pdf.js                                   # every test in the report
-node ci/export-suite-pdf.js DAGEP-1985                        # only titles containing this text (case-insensitive)
-node ci/export-suite-pdf.js "Review Page" --include-retries    # keep every retry attempt as its own PDF
-npm run export:pdf                                            # same as the first command
+node export-suite-pdf.js                              # every test in the report
+node export-suite-pdf.js ABC-123                      # only titles containing this text (case-insensitive)
+node export-suite-pdf.js "Login page" --include-retries   # keep every retry attempt as its own PDF
 ```
 
-| Env | What it does |
+| Argument | Meaning |
 |---|---|
-| `CHROME_BIN` | Chrome for Puppeteer (set in the CI image; empty locally = Puppeteer's own Chrome) |
-| `BUILD_NUMBER`, `BUILD_URL` | Jenkins: shows "Build #N" with a link in the facts box |
-| `REPORT_TZ` | Time zone of "Run at" and the footer (default `Asia/Kuala_Lumpur`) |
+| first non-`--` argument | Title filter: plain case-insensitive substring, not a regex |
+| `--include-retries` | One PDF per attempt instead of one per test |
 
-Exit code is `1` if there's no `allure-report/index.html`, nothing matches the filter, or any single PDF failed.
-
-## Who calls it
-
-- **Jenkins**, stage `Export PDFs` ([Jenkinsfile:324](../Jenkinsfile#L324)): runs inside the test image, filter =
-  the `JIRA_FILTER` parameter, copies `output/` back. Failure marks the build **unstable**, not failed. Skipped for
-  `RUN_TYPE=smoke`.
-- **[run-changed-tests-and-publish.js](run-changed-tests-and-publish.js)**: generate report, export, then push each
-  PDF to Zephyr with `zephyrClient.js`.
-
-## What it reads
-
-From `allure-report/data/test-cases/*.json` (one per test result):
-
-| PDF part | Comes from |
+| Env variable | Meaning |
 |---|---|
-| Status, title, duration, start/stop | `status`, `name`, `time` |
-| Environment / Product / Entry point / Run | labels `testEnv`, `testProduct`, `entryPoint`, `runId` (set by wdio.conf.js) |
-| Browser, Parameters | `parameters` (`browser` separated out) |
-| "Why it failed" + diff | `statusMessage` (ANSI stripped, `-` lines green, `+` lines red, max 40 lines) |
-| Failure screenshots / API calls | `testStage.attachments` whose name starts `[FAILED]` (from failureCapture) |
-| Setup journey | `beforeStages` = before/beforeEach hooks; shown as a step-name line + 4-column thumbnail grid |
-| Test steps | `testStage.steps` (nested), with their attachments inline |
+| `CHROME_BIN` | Chrome/Chromium to use (empty = Puppeteer's bundled Chrome) |
+| `BUILD_NUMBER`, `BUILD_URL` | CI build: shown as "Build #N" with a link |
+| `REPORT_TZ` | Time zone for times in the PDF (default `Asia/Kuala_Lumpur`) |
+
+**Exit code 1** when: no `allure-report/index.html`, no test matches the filter, or any single PDF fails.
+
+## What goes into each PDF
+
+Read from `allure-report/data/test-cases/*.json`; attachments from `allure-report/data/attachments/`.
+
+| Section | Source in the Allure JSON |
+|---|---|
+| Header: status badge, Jira key, title, tags, suite | `status`, `name`, label `suite` |
+| Facts box | labels `testEnv`, `testProduct`, `entryPoint`, `runId`; `parameters`; `time`; `retry` / `flaky` |
+| Why it failed | `statusMessage` (ANSI stripped, diff lines coloured, first 40 lines) + failure attachments |
+| Setup journey | `beforeStages` (before / beforeEach hooks): step names on one line, screenshots as a 4-column grid |
+| Test steps | `testStage.steps`, numbered, nested, attachments inline |
 | Where | `statusTrace`, only the `at ...` lines, first 12 |
+| Footer | key · environment · run time · page X of Y |
 
-Attachments are files in `allure-report/data/attachments/`.
+The custom labels (`testEnv`, `testProduct`, `entryPoint`, `runId`) are optional: a fact with no value is left out.
+
+## Conventions it expects
+
+- **Title tags:** `[ABC-123][Area] Page - Verify ...` → the leading `[...]` blocks become tags, the rest is the title.
+- **File name = first Jira-style key** in the title (`/[A-Z][A-Z0-9]+-\d{3,6}[A-Z]?/`). `[ABC-123][ABC-456]` →
+  `ABC-123.pdf`. No key (e.g. `[ABC-XXXX]`) → the sanitised full title is used.
+- **Failure attachments** are those whose name starts with `[FAILED] `; a `[FAILED] <title> - ` prefix is stripped
+  from the caption. They go under "Why it failed" instead of the steps.
+- **API call logs:** a JSON attachment that is an array of `{ method, url, response: { status, statusText, body } }`
+  is drawn as a table (non-2xx/3xx rows red) plus the response body (15 lines) of each bad call.
+- **Fallback screenshot:** an image attachment named `End of test (automatic...` is treated as "not the test's own
+  evidence" (see the warning below).
 
 ## How attachments render
 
-- **Image** → `<figure>`; caption dropped if it just repeats the step name.
-- **JSON array of `{method, url, response}`** → table of calls (non-2xx/3xx rows red) + response body of the failed
-  ones (15 lines). This is failureCapture's "Last N API calls" and `apiInterceptor.attachApiCall`.
-- **Other JSON** → pretty-printed text.
-- **Text** → `<pre>`, cut at 40 lines with "… N more lines in the Allure report".
-- **Missing file** → "Attachment not found: <name>".
+| Attachment | Rendered as |
+|---|---|
+| Image | Figure; caption dropped if it only repeats the step name |
+| API call array (JSON) | Calls table + failed response bodies |
+| Other JSON | Pretty-printed, max 40 lines |
+| Text | `<pre>`, max 40 lines, then "… N more lines in the Allure report" |
+| File missing | "Attachment not found: <name>" |
 
-## Rules worth remembering
+## Behaviour worth knowing
 
-- **File name = first Jira key in the title** (`/[A-Z][A-Z0-9]+-\d{3,6}[A-Z]?/`). The first key wins, so
-  `[DAGEP-1985][DAGEP-1032]` → `DAGEP-1985.pdf`. Placeholder `[DAGEP-XXXX]` has no digits → falls back to the
-  sanitised full title.
-- **`output/` is NOT cleaned.** If `DAGEP-1985.pdf` already exists, the new one becomes `DAGEP-1985-2.pdf`, `-3`...
-  Clear `output/` before a local run, or Zephyr gets an old PDF.
-- **Retries:** by default one PDF per title: the non-retry result wins, then the latest stop time.
-  `--include-retries` keeps them all (they'll get `-2`, `-3` suffixes).
-- **Filter** is a plain case-insensitive substring of the title, not a regex.
-- Setup hooks that passed with no screenshots/children are dropped (keeps the empty wrapper hooks out).
-- Journey thumbnails are re-encoded to JPEG (≤480 px wide, quality 0.8) in the page before printing, so PDFs stay
-  small. Full-size screenshots in the test steps are untouched.
-- Temporary HTML is written as `allure-report/.pdf-<uid>.html` (so `file://` images load) and deleted afterwards.
+- **`output/` is never cleaned.** If `ABC-123.pdf` exists, the new file becomes `ABC-123-2.pdf`, `-3`, ... Empty
+  `output/` before a run or an uploader may pick up an old PDF.
+- **Retries:** by default one result per title: a non-retry result beats a retry, then the latest stop time wins.
+  With `--include-retries` every attempt gets a PDF (with `-2`, `-3` suffixes).
+- Setup hooks that passed and recorded nothing are dropped, so empty hook wrappers don't clutter the page.
+- Setup-journey thumbnails are re-encoded to JPEG (max 480 px wide, quality 0.8) before printing to keep PDFs small;
+  screenshots in the test steps stay full size.
+- A temporary `allure-report/.pdf-<uid>.html` is written next to the report (so `file://` images load) and deleted
+  after each PDF.
+- Chrome is launched with `--no-sandbox --allow-file-access-from-files` (needed in containers and for local images).
 
-## The end-of-run warning
+## End-of-run warning
 
-After exporting it lists **passed** tests whose only image is wdio.conf.js's automatic
-`End of test (automatic ...)` screenshot. Those tests need an `evidenceStep` / `captureScreenshot` of their own
-(see the PDF evidence rule). Doesn't change the exit code.
+After exporting, the script lists **passed** tests whose only screenshot is the automatic `End of test (automatic...`
+one, i.e. tests that record no evidence of their own. It is a warning only; the exit code is not affected.
 
 ## Changing the look
 
-All layout is the `CSS` string near the top; page size/margins are in both `@page` and `page.pdf({ margin })`
-(keep them in sync). Status colours are in `STATUS`. Footer = key · ENV · run time · page X of Y
-(`footerTemplate`, inline styles only: Chrome's footer can't see the page CSS).
+- Layout: the `CSS` string near the top.
+- Page size and margins: in both `@page` (CSS) and `page.pdf({ margin })`; keep them in sync.
+- Status colours: the `STATUS` map.
+- Footer: `footerTemplate()`. Use inline styles only; Chrome's footer cannot see the page CSS.
 
-Quick visual check after a change:
+Quick check after a change:
 
 ```sh
-rm -rf output && node ci/export-suite-pdf.js DAGEP-1985 && open output/DAGEP-1985.pdf
+rm -rf output && node export-suite-pdf.js ABC-123 && open output/ABC-123.pdf
 ```
